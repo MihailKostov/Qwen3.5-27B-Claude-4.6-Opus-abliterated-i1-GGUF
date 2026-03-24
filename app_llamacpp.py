@@ -12,7 +12,6 @@ Architecture:
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 import httpx
 import subprocess
 import asyncio
@@ -21,9 +20,14 @@ import sys
 import time
 import json
 import platform
+import logging
 from pathlib import Path
 from datetime import datetime
 from typing import List, Optional, Dict, Any
+
+from pydantic import BaseModel, Field, AliasChoices, ConfigDict
+
+logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 if platform.system() == "Windows":
@@ -59,6 +63,8 @@ print(f"  GPU layers:    {N_GPU_LAYERS}")
 print(f"  Context:       {N_CTX}")
 print(f"  CPU threads:   {N_THREADS}")
 print(f"  llama port:    {LLAMA_PORT}")
+print(f"  Memory dir:    {MEMORY_DIR.resolve()}")
+print(f"  Default chat_id for memory (if omitted): {(os.getenv('DEFAULT_MEMORY_CHAT_ID') or 'default')!r}")
 print("=" * 60)
 
 # ── Launch llama-server.exe as a subprocess ───────────────────────────────────
@@ -116,17 +122,43 @@ class Message(BaseModel):
     content: str
 
 class ChatRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     # Backward-compatible path: caller can still pass full messages list.
     messages: Optional[List[Message]] = None
     # New path: send only latest user message and let server restore context.
-    chat_id: Optional[str] = None
-    system_prompt: Optional[str] = None
-    user_message: Optional[str] = None
-    max_new_tokens: Optional[int] = 512
+    chat_id: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("chat_id", "chatId"),
+    )
+    system_prompt: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("system_prompt", "systemPrompt"),
+    )
+    user_message: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("user_message", "userMessage"),
+    )
+    max_new_tokens: Optional[int] = Field(
+        default=512,
+        validation_alias=AliasChoices("max_new_tokens", "maxNewTokens"),
+    )
 
 class ChatResponse(BaseModel):
     response: str
     metrics: dict
+
+
+def _resolve_chat_id(req: ChatRequest) -> str:
+    """
+    Persist and load memory under this id. If the client omits chat_id (e.g. raw /chat with only
+    messages), fall back to DEFAULT_MEMORY_CHAT_ID env or 'default' so curl/local tests still write files.
+    """
+    raw = (req.chat_id or "").strip()
+    if raw:
+        return raw
+    fallback = (os.getenv("DEFAULT_MEMORY_CHAT_ID") or "default").strip()
+    return fallback or "default"
 
 
 def _safe_chat_id(chat_id: str) -> str:
@@ -233,58 +265,68 @@ def _extract_last_user_from_messages(messages: List[Dict[str, str]]) -> str:
     return ""
 
 
+def _message_to_openai_dict(m: Message) -> Dict[str, str]:
+    if hasattr(m, "model_dump"):
+        return m.model_dump()
+    return m.dict()
+
+
 def _build_messages_with_memory(req: ChatRequest) -> List[Dict[str, str]]:
-    # Legacy compatibility: if caller sends full history and no chat_id+user_message, use as-is.
-    if req.messages and not (req.chat_id and req.user_message is not None):
-        return [m.dict() for m in req.messages]
+    cid = _resolve_chat_id(req)
 
-    if not req.chat_id:
-        raise HTTPException(status_code=400, detail="chat_id is required when using server-side memory mode")
-    if req.user_message is None:
-        raise HTTPException(status_code=400, detail="user_message is required when using server-side memory mode")
+    # Server-side memory mode: latest user turn + stored summary / recent turns.
+    if req.user_message is not None:
+        memory = _load_memory(cid)
+        system_prompt = req.system_prompt or "You are a helpful assistant."
+        summary = (memory.get("summary") or "").strip()
+        recent_turns = memory.get("recent_turns", [])[-6:]
 
-    memory = _load_memory(req.chat_id)
-    system_prompt = req.system_prompt or "You are a helpful assistant."
-    summary = (memory.get("summary") or "").strip()
-    recent_turns = memory.get("recent_turns", [])[-6:]
+        messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+        if summary:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Conversation memory summary from previous turns. "
+                        "Use it as context, but prioritize latest user instructions.\n\n"
+                        f"{summary}"
+                    ),
+                }
+            )
+        for turn in recent_turns:
+            user_text = (turn.get("user") or "").strip()
+            assistant_text = (turn.get("assistant") or "").strip()
+            if user_text:
+                messages.append({"role": "user", "content": user_text})
+            if assistant_text:
+                messages.append({"role": "assistant", "content": assistant_text})
 
-    messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
-    if summary:
-        messages.append(
-            {
-                "role": "system",
-                "content": (
-                    "Conversation memory summary from previous turns. "
-                    "Use it as context, but prioritize latest user instructions.\n\n"
-                    f"{summary}"
-                ),
-            }
-        )
-    for turn in recent_turns:
-        user_text = (turn.get("user") or "").strip()
-        assistant_text = (turn.get("assistant") or "").strip()
-        if user_text:
-            messages.append({"role": "user", "content": user_text})
-        if assistant_text:
-            messages.append({"role": "assistant", "content": assistant_text})
+        messages.append({"role": "user", "content": req.user_message})
+        return messages
 
-    messages.append({"role": "user", "content": req.user_message})
-    return messages
+    # Legacy: full messages[] each request; memory still updates after reply under cid.
+    if req.messages:
+        return [_message_to_openai_dict(m) for m in req.messages]
+
+    raise HTTPException(
+        status_code=400,
+        detail="Provide either messages (full history) or user_message (server-side memory mode).",
+    )
 
 
 async def _persist_turn(req: ChatRequest, built_messages: List[Dict[str, str]], assistant_text: str) -> None:
-    if not req.chat_id:
-        return
+    chat_id = _resolve_chat_id(req)
     user_text = req.user_message or _extract_last_user_from_messages(built_messages)
-    if not user_text.strip() or not assistant_text.strip():
+    if not user_text.strip() or not (assistant_text or "").strip():
+        logger.debug("Skipping memory persist: missing user text or assistant text")
         return
 
-    memory = _load_memory(req.chat_id)
+    memory = _load_memory(chat_id)
     recent_turns = memory.get("recent_turns", [])
     recent_turns.append({"user": user_text, "assistant": assistant_text})
     memory["recent_turns"] = recent_turns[-10:]
     memory["summary"] = await _refresh_summary(memory.get("summary", ""), user_text, assistant_text)
-    _save_memory(req.chat_id, memory)
+    _save_memory(chat_id, memory)
 
 # ── Shutdown hook — kill llama-server when FastAPI stops ─────────────────────
 @app.on_event("shutdown")
@@ -397,7 +439,7 @@ async def chat_stream(req: ChatRequest):
             try:
                 await _persist_turn(req, built_messages, response_buffer)
             except Exception:
-                pass
+                logger.exception("conversation_memory: persist after /chat/stream failed")
             metrics = {
                 "first_token_latency_s": round(first_token_time - init_time, 3) if first_token_time else None,
                 "total_time_s":          round(total, 3),
@@ -411,6 +453,56 @@ async def chat_stream(req: ChatRequest):
         media_type="text/event-stream",
         headers={
             "Cache-Control":     "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/chat/stream-text")
+async def chat_stream_text(req: ChatRequest):
+    """
+    Streaming plain text chunks (AI SDK friendly).
+    This endpoint is useful for @ai-sdk/react `useCompletion` with streamProtocol='text'.
+    """
+    built_messages = _build_messages_with_memory(req)
+    payload = {
+        "messages": built_messages,
+        "max_tokens": req.max_new_tokens,
+        "stream": True,
+        "temperature": 0.7,
+    }
+
+    async def text_generator():
+        response_buffer = ""
+        try:
+            async with http_client.stream("POST", "/v1/chat/completions", json=payload) as r:
+                async for line in r.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    chunk = line[len("data:"):].strip()
+                    if chunk == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(chunk)
+                    except json.JSONDecodeError:
+                        continue
+
+                    token = data["choices"][0].get("delta", {}).get("content", "")
+                    if not token:
+                        continue
+                    response_buffer += token
+                    yield token
+        finally:
+            try:
+                await _persist_turn(req, built_messages, response_buffer)
+            except Exception:
+                logger.exception("conversation_memory: persist after /chat/stream-text failed")
+
+    return StreamingResponse(
+        text_generator(),
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
         },
     )
