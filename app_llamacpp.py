@@ -29,6 +29,41 @@ from pydantic import BaseModel, Field, AliasChoices, ConfigDict
 
 logger = logging.getLogger(__name__)
 
+# ── Memory config ─────────────────────────────────────────────────────────────
+MAX_ASSISTANT_STORE = 600   # chars stored per assistant turn
+MAX_SUMMARY_CHARS   = 800   # hard cap on summary size
+MAX_RECENT_TURNS    = 3     # raw turns kept verbatim
+COMPRESS_THRESHOLD  = 400   # only re-summarize when summary exceeds this
+
+SUMMARY_PROMPT = """You are a memory compressor for an AI assistant.
+
+Given the previous summary and a new exchange, produce an updated summary.
+
+Rules:
+- Maximum 5 bullet points total
+- Each bullet: one fact, one constraint, or one decision — under 20 words
+- Merge or drop bullets that are superseded by new information
+- Never include examples, code, or explanations — facts only
+- Format: "- [category]: [fact]" where category is Goal/Constraint/Decision/Context/Open
+
+Previous summary:
+{previous_summary}
+
+New exchange:
+User: {user_text}
+Assistant: {assistant_summary}
+
+Updated summary (5 bullets max):"""
+
+ENTITY_PROMPT = """Extract key facts from this message as bullet points.
+Only extract: names, IDs, technical specs, explicit constraints, explicit decisions.
+Skip opinions, questions, and general information.
+Maximum 3 bullets. If nothing worth extracting, return empty string.
+
+Message: {text}
+
+Facts:"""
+
 # ── Config ────────────────────────────────────────────────────────────────────
 if platform.system() == "Windows":
     LLAMA_SERVER_BIN = os.getenv(
@@ -148,6 +183,30 @@ class ChatResponse(BaseModel):
     response: str
     metrics: dict
 
+def _estimate_tokens(text: str) -> int:
+    return max(1, len(text) // 3)
+
+def _truncate_messages_to_fit(
+    messages: List[Dict[str, str]], max_ctx: int, reserve: int = 512
+) -> List[Dict[str, str]]:
+    budget = max_ctx - reserve
+    total = sum(_estimate_tokens(m.get("content", "")) for m in messages)
+    if total <= budget:
+        return messages
+
+    print(f"[WARN] ~{total} tokens estimated, truncating to fit {budget} token budget")
+    system_msgs = [m for m in messages if m["role"] == "system"]
+    non_system  = [m for m in messages if m["role"] != "system"]
+    last_user   = non_system[-1]
+    history     = non_system[:-1]
+
+    while history:
+        total = sum(_estimate_tokens(m.get("content", "")) for m in system_msgs + history + [last_user])
+        if total <= budget:
+            break
+        history.pop(0)
+
+    return system_msgs + history + [last_user]
 
 def _resolve_chat_id(req: ChatRequest) -> str:
     """
@@ -221,41 +280,50 @@ def _write_readme(chat_id: str, memory: Dict[str, Any], readme_path: Path) -> No
     readme_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
 
 
+async def _extract_facts(text: str) -> str:
+    """Lightweight call — extracts discrete facts from a single message."""
+    prompt = ENTITY_PROMPT.format(text=text[:1000])  # cap input
+    payload = {
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 80,
+        "stream": False,
+        "temperature": 0.1,
+    }
+    try:
+        r = await http_client.post("/v1/chat/completions", json=payload)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception:
+        return ""
+
+
 async def _refresh_summary(previous_summary: str, user_text: str, assistant_text: str) -> str:
-    summary_prompt = (
-        "You maintain compact conversation memory for a local assistant. "
-        "Return ONLY markdown bullet points with: user goals, constraints, decisions, and open tasks. "
-        "Keep it concise and practical."
+    """Full compression — only called when summary exceeds COMPRESS_THRESHOLD."""
+    # Truncate assistant text for the summary prompt — we don't need the full reply
+    assistant_snippet = assistant_text[:400] + ("..." if len(assistant_text) > 400 else "")
+
+    prompt = SUMMARY_PROMPT.format(
+        previous_summary=previous_summary or "(none)",
+        user_text=user_text[:600],
+        assistant_summary=assistant_snippet,
     )
     payload = {
-        "messages": [
-            {"role": "system", "content": summary_prompt},
-            {
-                "role": "user",
-                "content": (
-                    "Previous summary:\n"
-                    f"{previous_summary or '(none)'}\n\n"
-                    "Latest exchange:\n"
-                    f"User: {user_text}\n"
-                    f"Assistant: {assistant_text}\n\n"
-                    "Produce the updated summary now."
-                ),
-            },
-        ],
-        "max_tokens": 220,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 150,
         "stream": False,
         "temperature": 0.2,
     }
     try:
         r = await http_client.post("/v1/chat/completions", json=payload)
         r.raise_for_status()
-        data = r.json()
-        return data["choices"][0]["message"]["content"].strip()
+        new_summary = r.json()["choices"][0]["message"]["content"].strip()
+        # Enforce hard cap
+        return new_summary[:MAX_SUMMARY_CHARS]
     except Exception:
-        # Fallback if summarizer call fails: keep existing summary and append compact note.
+        # Fallback: keep existing summary, append a short note
         fallback = (previous_summary or "").strip()
-        append_line = f"- Latest: user asked '{user_text[:120]}', assistant replied '{assistant_text[:120]}'"
-        return (fallback + "\n" + append_line).strip()
+        note = f"- Context: user asked about '{user_text[:80]}'"
+        return (fallback + "\n" + note).strip()[:MAX_SUMMARY_CHARS]
 
 
 def _extract_last_user_from_messages(messages: List[Dict[str, str]]) -> str:
@@ -302,7 +370,7 @@ def _build_messages_with_memory(req: ChatRequest) -> List[Dict[str, str]]:
                 messages.append({"role": "assistant", "content": assistant_text})
 
         messages.append({"role": "user", "content": req.user_message})
-        return messages
+        return _truncate_messages_to_fit(messages, N_CTX)
 
     # Legacy: full messages[] each request; memory still updates after reply under cid.
     if req.messages:
@@ -314,18 +382,43 @@ def _build_messages_with_memory(req: ChatRequest) -> List[Dict[str, str]]:
     )
 
 
-async def _persist_turn(req: ChatRequest, built_messages: List[Dict[str, str]], assistant_text: str) -> None:
+async def _persist_turn(
+    req: ChatRequest,
+    built_messages: List[Dict[str, str]],
+    assistant_text: str,
+) -> None:
     chat_id = _resolve_chat_id(req)
     user_text = req.user_message or _extract_last_user_from_messages(built_messages)
+
     if not user_text.strip() or not (assistant_text or "").strip():
-        logger.debug("Skipping memory persist: missing user text or assistant text")
+        logger.debug("Skipping memory persist: missing user or assistant text")
         return
 
     memory = _load_memory(chat_id)
+    current_summary = memory.get("summary", "")
+
+    # Truncate assistant response before storing — full response not needed for context
+    assistant_snippet = assistant_text.strip()[:MAX_ASSISTANT_STORE]
+    if len(assistant_text) > MAX_ASSISTANT_STORE:
+        assistant_snippet += "... [truncated]"
+
+    # Update recent turns
     recent_turns = memory.get("recent_turns", [])
-    recent_turns.append({"user": user_text, "assistant": assistant_text})
-    memory["recent_turns"] = recent_turns[-10:]
-    memory["summary"] = await _refresh_summary(memory.get("summary", ""), user_text, assistant_text)
+    recent_turns.append({"user": user_text, "assistant": assistant_snippet})
+    memory["recent_turns"] = recent_turns[-MAX_RECENT_TURNS:]
+
+    # Two-path summary update:
+    # - Summary is long → run full compression (expensive, occasional)
+    # - Summary is short → just extract facts and append (cheap, every turn)
+    if len(current_summary) > COMPRESS_THRESHOLD:
+        memory["summary"] = await _refresh_summary(
+            current_summary, user_text, assistant_text
+        )
+    else:
+        new_facts = await _extract_facts(user_text)
+        if new_facts:
+            memory["summary"] = (current_summary + "\n" + new_facts).strip()[:MAX_SUMMARY_CHARS]
+
     _save_memory(chat_id, memory)
 
 # ── Shutdown hook — kill llama-server when FastAPI stops ─────────────────────
